@@ -1,4 +1,29 @@
-use_default_settings: true
+# 2026-09-12: /v1/search was returning 503 `search_degraded` on every query.
+# Root cause: `use_default_settings: true` loaded SearXNG's default engine
+# roster (Google, Bing, Startpage, Yahoo…), whose keyless scraping endpoints
+# 403/429 this deployment's datacenter IP. SearXNG itself was healthy — it
+# answered in ~1.3s with empty results + `unresponsive_engines`, which crw
+# maps to SearchDegraded. ALL engines failing → empty pool → 503 on every
+# query. Not a code regression: the same defaults work on residential IPs.
+#
+# Fix: stop inheriting the default engine roster and run a curated keyless
+# set of independent indexes that tolerate datacenter source IPs. crw calls
+# a response healthy when ≥1 engine returns results
+# (`is_degraded` = empty results AND unresponsive engines), so the goal is
+# redundancy across independent indexes, not one "best" engine.
+#
+# If even these get blocked (they can — it's the same arms race), the
+# escalation ladder is: (1) API keys — Brave/Mojeek/Marginalia all offer
+# them, see the commented lines below; (2) an `outgoing.proxies` residential
+# proxy, which would also re-unlock Google/Bing via the default roster.
+
+use_default_settings:
+  # Keep upstream defaults for server/search/preferences sections, but do
+  # NOT load the default engine roster — the engines listed below are the
+  # only ones that run. Inheriting the defaults guarantees a polluted
+  # unresponsive list and per-query timeout waste on engines that
+  # hard-block this host's IP.
+  engines: false
 
 general:
   instance_name: "crw-search"
@@ -32,3 +57,78 @@ server:
   public_instance: false
   image_proxy: false
   method: "GET"
+
+engines:
+  # Roster criteria: keyless (no signup), independent indexes (not
+  # Bing/Google resellers — those inherit the same IP blocks), known
+  # tolerance for datacenter source IPs. Ordered by expected result
+  # quality for crw's agent-research workload.
+
+  # 1. Brave — scrapes search.brave.com keyless (SearXNG's brave engine has
+  #    require_api_key: False). Independent index; currently the closest to
+  #    Google/Bing coverage among the keyless options.
+  - name: brave
+    engine: brave
+    shortcut: br
+    categories: [general]
+    disabled: false
+    # If Brave starts challenging this IP: Search API key
+    # (https://api-dashboard.search.brave.com, free tier exists) →
+    # api_key: "BSA..."
+
+  # 2. Mojeek — own crawler + own index, keyless, lenient with
+  #    non-residential IPs. Key raises rate limits if ever needed:
+  #    https://www.mojeek.com/services/api/web_search/
+  - name: mojeek
+    engine: mojeek
+    shortcut: mjk
+    categories: [general]
+    disabled: false
+    # api_key: ""
+
+  # 3. DuckDuckGo — keyless, usually tolerates datacenter IPs. If it lands
+  #    in cooldown it drops out of the pool without affecting the others.
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    categories: [general]
+    disabled: false
+
+  # 4. Qwant — keyless access, independent European index. Upstream keeps
+  #    it disabled by default (occasional reliability dips), hence the
+  #    explicit enable and its position in the roster.
+  - name: qwant
+    engine: qwant
+    qwant_categ: web
+    shortcut: qw
+    categories: [general]
+    disabled: false
+
+  # 5. Marginalia — independent non-commercial index; strong on long-tail
+  #    and non-SEO content, weak on commercial queries. Keyless works,
+  #    a key raises result volume:
+  #    https://about.marginalia-search.com/article/api/
+  - name: marginalia
+    engine: marginalia
+    shortcut: mar
+    categories: [general]
+    disabled: false
+    # api_key: ""
+
+  # 6. Mwmbl — free open API, no key, small crowdfunded index. Cheap extra
+  #    redundancy for the pool.
+  - name: mwmbl
+    engine: mwmbl
+    shortcut: mwm
+    categories: [general]
+    disabled: false
+
+  # 7. Wikipedia — API-backed, never IP-blocks. Upstream defaults it to
+  #    infobox-only display; "list" is added so its hits actually land in
+  #    the JSON results array crw consumes.
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    categories: [general]
+    display_type: ["infobox", "list"]
+    disabled: false
