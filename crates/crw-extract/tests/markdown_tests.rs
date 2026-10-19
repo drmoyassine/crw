@@ -89,3 +89,34 @@ fn markdown_definition_table_sections_survive() {
     );
     assert!(md.contains("English B2"), "inline td content dropped: {md}");
 }
+
+/// Adjacent inline value cells in a definition row must not fuse into one
+/// token through the full pipeline.
+#[test]
+fn markdown_definition_table_multi_td_values_do_not_fuse() {
+    let html = r#"<h4>Fees</h4>
+<table><tbody><tr><th>Fees</th><td>100 EUR</td><td>per semester</td></tr></tbody></table>"#;
+    let md = html_to_markdown_with(html, true);
+    assert!(
+        md.contains("100 EUR per semester"),
+        "adjacent inline values fused: {md}"
+    );
+}
+
+/// Stray content inside a table's raw byte range survives: the
+/// splice-fidelity veto leaves such tables byte-for-byte untouched, so the
+/// stray renders beside the table instead of being silently deleted by the
+/// splice. The table itself falls back to htmd's headerless path (row 1 as
+/// header) — the pre-existing behavior for any table normalization leaves
+/// alone.
+#[test]
+fn markdown_stray_content_inside_a_table_survives() {
+    let html = "<p>Before</p><table><tbody><tr><th>Label</th><td>H</td></tr><tr><th>L2</th><td>V2</td><span>STRAY</span></tr></tbody></table><p>After</p>";
+    let md = html_to_markdown_with(html, true);
+    assert!(md.contains("STRAY"), "stray deleted by splice: {md}");
+    assert!(md.contains("V2"), "value lost: {md}");
+    assert!(
+        md.contains("Before") && md.contains("After"),
+        "surrounding prose disturbed: {md}"
+    );
+}

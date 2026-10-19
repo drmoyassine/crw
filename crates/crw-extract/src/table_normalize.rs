@@ -42,12 +42,25 @@
 //! disagreement, returning the original bytes rather than silently swallowing
 //! a table.
 //!
+//! The count check cannot catch strays INSIDE one table's bytes: html5ever
+//! foster-parents illegal row content (a stray `<span>` after a `</td>`, a
+//! `<div>` or bare text between rows) out of the table DOM — it lands as a
+//! sibling beside the table — while `lol_html`'s `replace` overwrites the
+//! table's RAW byte range, which still contains those bytes, silently
+//! deleting them. `veto_unfaithful_splices` therefore re-emits each slated
+//! table's raw bytes between sentinels, re-parses the slice standalone
+//! (foster-parented strays then sit at body level BESIDE the table, an
+//! unambiguous signal), and vetoes any replacement whose slice holds content
+//! outside the table element. A veto leaves that table's original bytes in
+//! place — the pre-normalization behavior, never worse.
+//!
 //! Gated entirely behind `ExtractionConfig::normalize_tables`; see
 //! `markdown::html_to_markdown_with`.
 
 use crate::tables;
 use lol_html::html_content::{ContentType, EndTag};
 use lol_html::{HandlerResult, RewriteStrSettings, doc_comments, element, rewrite_str};
+use scraper::node::Node;
 use scraper::{ElementRef, Html, Selector};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -120,7 +133,11 @@ fn cell_inner_html(cell: ElementRef<'_>) -> String {
 /// Normalize every top-level `<table>` in `html`, leaving everything else ,
 /// including nested tables, byte-for-byte untouched.
 pub fn normalize_tables(html: &str) -> String {
-    let replacements = build_replacements(html);
+    let mut replacements = build_replacements(html);
+    if replacements.iter().all(Option::is_none) {
+        return html.to_string();
+    }
+    veto_unfaithful_splices(html, &mut replacements);
     if replacements.iter().all(Option::is_none) {
         return html.to_string();
     }
@@ -141,13 +158,16 @@ fn build_replacements(html: &str) -> Vec<Option<String>> {
             //
             // A table that clears the data threshold but carries no header the
             // grid path can use — every row mixed th+td, e.g. Wikipedia
-            // infoboxes — ALSO falls through to the definition unroll: the
-            // classifier's uniform-columns and multi-row bonuses score those
-            // ≥7 while `build_replacement` declines them (no thead, no leading
-            // all-th run), which would leave htmd dropping every label but the
-            // first. The definition path re-applies the same cell-size ceiling
-            // and declines on thead/unmixed rows, so a table the grid path
-            // rejected for size stays untouched.
+            // infoboxes — ALSO falls through to the definition unroll, and so
+            // does a table BELOW the threshold: the classifier's grid-shaped
+            // features (uniformity, multi-row) systematically under-score
+            // one-row label/value tables, while htmd's headerless path drops
+            // their values outright — three of elte.hu's five course-section
+            // tables score 4–6 there. The definition path's own claim (every
+            // row mixed, no thead) is the tighter gate; it re-applies the
+            // cell-size ceiling, adds cell-count and output-byte ceilings,
+            // and expands no spans, so a table the grid path declined for
+            // EXPANDED size can still be unrolled from its raw cells.
             tables::is_likely_data_table(table)
                 .then(|| build_replacement(table))
                 .flatten()
@@ -270,8 +290,10 @@ fn build_replacement(table: ElementRef<'_>) -> Option<String> {
 /// pipe-table header with every `<td>` dropped, an N-row table keeps only
 /// the first label with the orphaned `<td>` values misaligned below it.
 ///
-/// Unrolled instead into prose: bold labels, then the value cells' HTML as
-/// block content. Claims a table only when EVERY row mixes `th` and `td` and
+/// Unrolled instead into prose: bold labels, then the value cells' HTML —
+/// block markup separates itself, and a row's inline value cells are joined
+/// with a space so adjacent values never fuse into one token. Claims a table
+/// only when EVERY row mixes `th` and `td` and
 /// there is no `<thead>` — a single all-`th` or all-`td` row means a real
 /// header/body table and stays on the htmd path byte-for-byte, preserving
 /// the `headerless_table_is_left_untouched` guarantee.
@@ -283,6 +305,11 @@ fn build_definition_replacement(table: ElementRef<'_>) -> Option<String> {
 
     let mut out = String::new();
     let mut rows = 0usize;
+    let mut cells_seen = 0usize;
+    // Whether the last content pushed was an inline value cell: adjacent
+    // inline values need a space between them, but a block boundary (a
+    // label `<p>`, or the very start) separates itself.
+    let mut after_inline_value = false;
 
     for child in table.child_elements() {
         let section_rows: Vec<ElementRef<'_>> = match child.value().name() {
@@ -316,6 +343,13 @@ fn build_definition_replacement(table: ElementRef<'_>) -> Option<String> {
             }
 
             rows += 1;
+            // The unroll emits every raw cell verbatim, so bound it by the
+            // same total-cell ceiling as the grid path: this caps both the
+            // unroll's size and the bytes appended between the checks below.
+            cells_seen += cells.len();
+            if cells_seen > MAX_GRID_CELLS {
+                return None;
+            }
             let labels: Vec<&str> = cells
                 .iter()
                 .filter(|c| c.is_th)
@@ -336,8 +370,21 @@ fn build_definition_replacement(table: ElementRef<'_>) -> Option<String> {
                     out.push_str(&joined);
                 }
                 out.push_str("</p>");
+                // A label block is a block boundary: the values that follow
+                // it separate themselves.
+                after_inline_value = false;
             }
             for cell in cells.iter().filter(|c| !c.is_th) {
+                // Inline value cells separate themselves only when they hold
+                // block markup; a bare space keeps adjacent inline values
+                // ("100 EUR" + "per semester") from fusing into
+                // "100 EURper semester", whether they share a row or meet
+                // across a row whose labels were all empty (no `<p>` block
+                // between them); whitespace beside block markup collapses.
+                if after_inline_value {
+                    out.push(' ');
+                }
+                after_inline_value = true;
                 out.push_str(&cell.html);
             }
             if out.len() > MAX_GRID_BYTES {
@@ -557,6 +604,153 @@ fn serialize_table(
     out
 }
 
+// ─── Splice fidelity guard (scraper vs lol_html divergence) ────────────────
+
+/// Decline replacements whose table's raw byte range holds content outside
+/// the table element itself.
+///
+/// html5ever foster-parents illegal row content — a stray `<span>` after a
+/// `</td>`, a `<div>` or bare text between rows — out of the table DOM (it
+/// lands beside the table as a sibling), but `lol_html`'s `el.replace`
+/// overwrites the table's RAW byte range, which still contains those bytes:
+/// replacing the table silently deletes them. The count fail-safe in
+/// `splice_tables` cannot see this (both parsers agree on the table count),
+/// so each slated table's raw bytes are re-emitted between sentinels, sliced
+/// out, and re-parsed standalone — fostered strays then sit at body level
+/// BESIDE the table, which is unambiguous. Any veto leaves that table's
+/// original bytes in place: the pre-normalization behavior, never worse.
+fn veto_unfaithful_splices(html: &str, replacements: &mut [Option<String>]) {
+    let wanted: Vec<bool> = replacements.iter().map(Option::is_some).collect();
+    let Some(slices) = table_raw_slices(html, &wanted) else {
+        // The sentinel rewrite itself failed, or the table counts disagree —
+        // the index correlation is unsound, so decline every replacement.
+        for slot in replacements.iter_mut() {
+            *slot = None;
+        }
+        return;
+    };
+    for (slot, slice) in replacements.iter_mut().zip(slices) {
+        if slot.is_none() {
+            continue;
+        }
+        match slice.as_deref() {
+            Some(slice) if slice_has_stray_content(slice) => *slot = None,
+            // A lost sentinel leaves the slice unverifiable: veto.
+            None => *slot = None,
+            Some(_) => {}
+        }
+    }
+}
+
+/// Slice each wanted table's raw bytes out of `html` by re-emitting them
+/// between control-character sentinels in a throwaway `lol_html` rewrite.
+/// Inner `None` marks a slot whose sentinels could not be found; the outer
+/// `Option` fails the whole call when the rewrite fails or the visited
+/// table count disagrees with `wanted.len()` (the same unsound correlation
+/// `splice_tables` guards against).
+fn table_raw_slices(html: &str, wanted: &[bool]) -> Option<Vec<Option<String>>> {
+    let depth = Rc::new(Cell::new(0u32));
+    let index = Rc::new(Cell::new(0usize));
+    let seen = Rc::clone(&index);
+    let expected = wanted.len();
+    let markers: Vec<bool> = wanted.to_vec();
+
+    let handler = element!("table", move |el| {
+        let d = depth.get();
+        if d == 0 {
+            let i = index.get();
+            if markers.get(i).copied().unwrap_or(false) {
+                // Note the sentinels are NOT unforgeable: control characters
+                // pass through both parsers verbatim, so page content can
+                // contain copies of them — the scan below scans accordingly
+                // (see table_raw_slices).
+                el.before(&format!("\u{1}{i}\u{2}"), ContentType::Text);
+                el.after(&format!("\u{3}{i}\u{4}"), ContentType::Text);
+            }
+            index.set(i + 1);
+        }
+        depth.set(d + 1);
+
+        let depth_end = Rc::clone(&depth);
+        let end_handler: Box<dyn FnOnce(&mut EndTag<'_>) -> HandlerResult + 'static> =
+            Box::new(move |_end| {
+                depth_end.set(depth_end.get().saturating_sub(1));
+                Ok(())
+            });
+        el.on_end_tag(end_handler)?;
+
+        Ok(())
+    });
+
+    let settings = RewriteStrSettings::new().append_element_content_handler(handler);
+    let out = rewrite_str(html, settings).ok()?;
+    if seen.get() != expected {
+        return None;
+    }
+
+    // Tables are visited in document order, so their sentinels appear in
+    // order; scan for each pair from the end of the previous slice.
+    //
+    // The sentinels are forgeable: control characters pass through both
+    // parsers verbatim (only `&`, `<`, `>` are escaped in inserted text), so
+    // page content can carry copies of a marker inside the very byte range
+    // being sliced. The defense is directional: take the start marker as the
+    // FIRST match at/after the cursor, but the end marker as the LAST match
+    // at/after the start. A forged end marker inside the table can then only
+    // be EARLIER than the real one, so it cannot truncate the slice; any
+    // forged marker that wins (inside or after the table, or a forged start
+    // in earlier prose) can only WIDEN the slice, and a widened slice shows
+    // up as body-level stray content → veto. Every forgery fails toward the
+    // veto, never toward a truncated pass.
+    let mut slices = Vec::with_capacity(wanted.len());
+    let mut cursor = 0usize;
+    for (i, &w) in wanted.iter().enumerate() {
+        if !w {
+            slices.push(None);
+            continue;
+        }
+        let start_marker = format!("\u{1}{i}\u{2}");
+        let end_marker = format!("\u{3}{i}\u{4}");
+        let start = out[cursor..]
+            .find(&start_marker)
+            .map(|p| p + cursor + start_marker.len());
+        let end = start.and_then(|s| out[s..].rfind(&end_marker).map(|p| s + p));
+        match (start, end) {
+            (Some(s), Some(e)) => {
+                slices.push(Some(out[s..e].to_string()));
+                cursor = e;
+            }
+            _ => slices.push(None),
+        }
+    }
+    Some(slices)
+}
+
+/// True when the slice parses to anything other than exactly one `<table>`
+/// element at body level: foster-parented stray text or elements, or a slice
+/// the parser had to materially reshape.
+fn slice_has_stray_content(slice: &str) -> bool {
+    let doc = Html::parse_document(slice);
+    let Some(body) = doc.select(&Selector::parse("body").unwrap()).next() else {
+        return true;
+    };
+    let mut saw_table = false;
+    for child in body.children() {
+        match child.value() {
+            Node::Text(t) if !t.text.trim().is_empty() => return true,
+            Node::Element(el) => {
+                if el.name() == "table" && !saw_table {
+                    saw_table = true;
+                } else {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    !saw_table
+}
+
 // ─── Pass B: rewrite (lol_html) ─────────────────────────────────────────────
 
 fn splice_tables(html: &str, replacements: Vec<Option<String>>) -> String {
@@ -676,6 +870,161 @@ mod tests {
             out.contains("English B2") && out.contains("One reference letter."),
             "values dropped: {out}"
         );
+    }
+
+    /// A row's inline value cells are joined with a space so adjacent values
+    /// never fuse into one token ("100 EURper semester").
+    #[test]
+    fn definition_table_inline_value_cells_do_not_fuse() {
+        let html = r#"<table><tbody><tr><th>Fees</th><td>100 EUR</td><td>per semester</td></tr></tbody></table>"#;
+        let out = normalize_tables(html);
+        assert!(
+            out.contains("100 EUR per semester"),
+            "adjacent inline values fused: {out}"
+        );
+        assert!(!out.contains("EURper"), "values must not fuse: {out}");
+    }
+
+    /// Multi-row definition tables keep every row's values separated per
+    /// row.
+    #[test]
+    fn definition_table_row_values_stay_separate() {
+        let html = r#"<table><tbody>
+            <tr><th>Revenue</th><td>100</td><td>200</td></tr>
+            <tr><th>Costs</th><td>50</td><td>60</td></tr>
+        </tbody></table>"#;
+        let out = normalize_tables(html);
+        assert!(out.contains("100 200"), "row values fused: {out}");
+        assert!(out.contains("50 60"), "row values fused: {out}");
+    }
+
+    /// The definition unroll is not gated on the data-table classifier: a
+    /// one-row label/value table scores well under the grid threshold (no
+    /// uniformity or multi-row bonus, short text) yet htmd's headerless
+    /// path would drop its value outright.
+    #[test]
+    fn short_definition_table_below_classifier_threshold_is_still_unrolled() {
+        let html = r#"<table><tbody><tr><th>Branch</th><td>Downtown</td></tr></tbody></table>"#;
+        // Pin the premise: this fixture scores BELOW the data-table
+        // threshold, so the unroll below exercises the
+        // classifier-independent path.
+        let doc = Html::parse_document(html);
+        let table = doc
+            .select(&Selector::parse("table").unwrap())
+            .next()
+            .expect("fixture table");
+        assert!(
+            !tables::is_likely_data_table(table),
+            "fixture must score below the classifier threshold for this test to mean what it says"
+        );
+        let out = normalize_tables(html);
+        assert!(
+            out.contains("<strong>Branch</strong>") && out.contains("Downtown"),
+            "short definition table left on the htmd path: {out}"
+        );
+    }
+
+    /// Stray TEXT between rows is foster-parented out of the DOM but stays
+    /// inside the table's byte range: the veto leaves the table untouched.
+    #[test]
+    fn stray_text_between_rows_leaves_the_table_untouched() {
+        let html = r#"<table><tbody><tr><th>Label</th><td>value</td></tr>STRAY<div>ALSO_STRAY</div><tr><th>Two</th><td>2</td></tr></tbody></table>"#;
+        assert_eq!(normalize_tables(html), html);
+    }
+
+    /// The veto binds the GRID path exactly as it binds the definition path:
+    /// a stray element inside a thead-bearing table also cancels its rewrite.
+    #[test]
+    fn stray_element_also_vetoes_a_grid_replacement() {
+        let html = r#"<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td rowspan="2">x</td><span>STRAY</span><td>1</td></tr><tr><td>2</td></tr></tbody></table>"#;
+        assert_eq!(normalize_tables(html), html);
+    }
+
+    /// A vetoed table must not block a clean sibling: replacements are
+    /// decided per table, index-correlated.
+    #[test]
+    fn vetoed_table_does_not_block_a_clean_sibling() {
+        let stray = r#"<table class="ui table"><tbody><tr><th>Fees</th><td>100</td><span>STRAY_NOTE</span></tr></tbody></table>"#;
+        let clean = r#"<table class="ui table"><tbody><tr><th>Fees</th><td><strong>100 EUR</strong></td></tr></tbody></table>"#;
+        let html = format!("Before{stray}Middle{clean}After");
+        let out = normalize_tables(&html);
+        assert!(out.contains("STRAY_NOTE"), "stray deleted: {out}");
+        assert!(
+            out.contains("<strong>Fees</strong>"),
+            "clean sibling not unrolled: {out}"
+        );
+        assert!(
+            out.contains("Before") && out.contains("Middle") && out.contains("After"),
+            "surrounding prose disturbed: {out}"
+        );
+    }
+
+    /// The unroll is bounded by the same total-cell ceiling as the grid
+    /// path: above it the table is left untouched.
+    #[test]
+    fn definition_table_over_max_grid_cells_is_left_untouched() {
+        let mut html = String::from("<table><tbody>");
+        for r in 0..(MAX_GRID_CELLS / 2 + 1) {
+            html.push_str(&format!("<tr><th>L{r}</th><td>v{r}</td></tr>"));
+        }
+        html.push_str("</tbody></table>");
+        assert_eq!(
+            normalize_tables(&html),
+            html,
+            "over-ceiling definition table must stay untouched"
+        );
+    }
+
+    /// The cap boundary itself: a table of exactly MAX_GRID_CELLS cells
+    /// still unrolls (`>`, not `>=`); one more cell leaves it untouched
+    /// (companion test above).
+    #[test]
+    fn definition_table_at_exact_max_grid_cells_still_unrolls() {
+        let mut html = String::from("<table><tbody>");
+        for r in 0..(MAX_GRID_CELLS / 2) {
+            html.push_str(&format!("<tr><th>L{r}</th><td>v{r}</td></tr>"));
+        }
+        html.push_str("</tbody></table>");
+        let out = normalize_tables(&html);
+        assert_ne!(out, html, "at-cap table must still unroll");
+        assert!(out.contains("<strong>L0</strong>"), "first label missing");
+        assert!(
+            out.contains("<strong>L2499</strong>"),
+            "deep label missing — traversal or cap off by one"
+        );
+    }
+
+    /// A forged copy of a table's END sentinel inside its own bytes must not
+    /// truncate the veto slice: a stray further on is still detected and the
+    /// table left untouched. (Control characters pass through the parsers
+    /// verbatim, so page content CAN carry marker bytes.)
+    #[test]
+    fn forged_end_sentinel_inside_the_table_does_not_defeat_the_veto() {
+        let html = "<table><tbody><tr><th>Label</th><td>value\u{3}0\u{4}</td><span>STRAY_TAIL</span></tr></tbody></table>";
+        assert_eq!(normalize_tables(html), html);
+    }
+
+    /// A forged START sentinel in the prose before a clean table widens the
+    /// slice with that prose → stray detected → veto: the conservative
+    /// direction (untouched table, never a truncated pass).
+    #[test]
+    fn forged_start_sentinel_in_prose_vetoes_conservatively() {
+        let html = "<p>note \u{1}0\u{2} end</p><table><tbody><tr><th>Fees</th><td>100 EUR</td></tr></tbody></table>";
+        assert_eq!(normalize_tables(html), html);
+    }
+
+    /// Rows whose labels are all empty emit no `<p>` block, so values from
+    /// adjacent rows sit inline next to each other — they must still get the
+    /// separating space.
+    #[test]
+    fn definition_table_empty_label_rows_do_not_fuse_across_rows() {
+        let html = r#"<table><tbody><tr><th> </th><td>100 EUR</td></tr><tr><th></th><td>per semester</td></tr></tbody></table>"#;
+        let out = normalize_tables(html);
+        assert!(
+            out.contains("100 EUR per semester"),
+            "cross-row values fused: {out}"
+        );
+        assert!(!out.contains("EURper"), "values must not fuse: {out}");
     }
 
     /// A table with any unmixed row (all-`th` or all-`td`) is a gridded
@@ -1272,17 +1621,19 @@ mod tests {
         assert!(out.contains("<table"));
     }
 
+    /// A stray non-cell element inside a row is foster-parented OUT of the
+    /// table by html5ever, but its bytes still sit inside the table's raw
+    /// byte range — which `el.replace` would overwrite. The splice-fidelity
+    /// veto leaves such a table byte-for-byte untouched rather than silently
+    /// deleting the stray.
     #[test]
-    fn extract_cells_ignores_non_td_th_children() {
+    fn stray_element_inside_a_row_leaves_the_table_untouched() {
         let html = r#"<table>
-            <thead><tr><th>A</th><span>ignored</span><th>B</th></tr></thead>
+            <thead><tr><th>A</th><span>STRAY_NOTE</span><th>B</th></tr></thead>
             <tbody><tr><td>1</td><td>2</td></tr></tbody>
         </table>"#;
         let out = normalize_tables(html);
-        let doc = Html::parse_document(&out);
-        let head_count = doc.select(&Selector::parse("thead th").unwrap()).count();
-        assert_eq!(head_count, 2, "span must not become a header cell: {out}");
-        assert!(!out.contains("ignored"));
+        assert_eq!(out, html, "stray content must survive untouched");
     }
 
     // ── ragged rows / empty cells ────────────────────────────────────────

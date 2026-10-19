@@ -149,7 +149,8 @@ pub struct ExtractOptions<'a> {
     /// JS-escalation loop so that all attempts land in one trace.
     pub debug_sink: Option<Arc<Mutex<DebugCollector>>>,
     /// Expand table `rowspan`/`colspan` into a flat grid before markdown
-    /// conversion. From `ExtractionConfig::normalize_tables`; ships false.
+    /// conversion. From `ExtractionConfig::normalize_tables`; default true
+    /// (set false for the byte-identical legacy output).
     pub normalize_tables: bool,
 }
 
