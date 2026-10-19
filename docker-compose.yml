@@ -1,6 +1,11 @@
 services:
   crw:
     build: .
+    # Load-bearing like the deps below: without a restart policy a host reboot
+    # (or container exit) leaves the API down while searxng/lightpanda come
+    # back healthy — the public endpoint serves 502s until a manual `compose
+    # up`. Observed in production 2026-10-17: ~12h silent outage.
+    restart: unless-stopped
     ports:
       # Override the host bind address / port via `.env` (CRW_BIND_ADDRESS,
       # CRW_HOST_PORT) for boxes already using 3000, or to stop publishing on
