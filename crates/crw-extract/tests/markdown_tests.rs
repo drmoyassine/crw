@@ -1,4 +1,4 @@
-use crw_extract::markdown::html_to_markdown;
+use crw_extract::markdown::{html_to_markdown, html_to_markdown_with};
 
 #[test]
 fn markdown_empty_input() {
@@ -63,4 +63,29 @@ fn markdown_strips_data_uri_images() {
     );
     assert!(md.contains("Before"));
     assert!(md.contains("After"));
+}
+
+/// University course pages (elte.hu) lay out each section as a one-row
+/// definition table. htmd's headerless path consumed the `<th>` as a lone
+/// pipe-table header and dropped the `<td>` content entirely — the page
+/// rendered as headings over empty sections.
+#[test]
+fn markdown_definition_table_sections_survive() {
+    let html = r#"<h4>Entry qualification</h4>
+<table><tbody><tr><th>Entry qualification</th><td><p>Graduate / Master diploma (or higher).</p><p>Good classification.</p></td></tr></tbody></table>
+<table><tbody><tr><th>Language requirements</th><td>English B2</td></tr></tbody></table>"#;
+    let md = html_to_markdown_with(html, true);
+    assert!(
+        md.contains("**Entry qualification**"),
+        "bold label missing: {md}"
+    );
+    assert!(
+        md.contains("Graduate / Master diploma"),
+        "td block content dropped: {md}"
+    );
+    assert!(
+        md.contains("Good classification"),
+        "second paragraph dropped: {md}"
+    );
+    assert!(md.contains("English B2"), "inline td content dropped: {md}");
 }
