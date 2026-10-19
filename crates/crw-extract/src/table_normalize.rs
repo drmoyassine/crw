@@ -10,6 +10,13 @@
 //! or a leading run of all-`<th>` rows) are rewritten. Synthesizing a header for
 //! a headerless table was measured on a 15-page corpus (46 data tables) and
 //! fired exactly once, on Hacker News' layout grid, so it is not attempted.
+//! One further shape IS rewritten: definition tables, where every row is a
+//! `<th>` label beside its `<td>` value. They have no header row to normalize
+//! against, and htmd's headerless path consumes the first `th`-bearing row AS
+//! the header — a one-row table becomes a lone pipe-table header with every
+//! `<td>` dropped (observed on elte.hu course pages: "Entry qualification"
+//! rendered as a heading over nothing). Those are unrolled into bold-label
+//! prose by `build_definition_replacement`.
 //!
 //! Two passes, mirroring the `scraper` (read) + `lol_html` (rewrite) split
 //! already used in `clean.rs`:
@@ -131,9 +138,20 @@ fn build_replacements(html: &str) -> Vec<Option<String>> {
         .map(|table| {
             // Layout tables (nav shells, newsletter grids) are left alone: they
             // carry no tabular meaning and rewriting them only churns bytes.
+            //
+            // A table that clears the data threshold but carries no header the
+            // grid path can use — every row mixed th+td, e.g. Wikipedia
+            // infoboxes — ALSO falls through to the definition unroll: the
+            // classifier's uniform-columns and multi-row bonuses score those
+            // ≥7 while `build_replacement` declines them (no thead, no leading
+            // all-th run), which would leave htmd dropping every label but the
+            // first. The definition path re-applies the same cell-size ceiling
+            // and declines on thead/unmixed rows, so a table the grid path
+            // rejected for size stays untouched.
             tables::is_likely_data_table(table)
                 .then(|| build_replacement(table))
                 .flatten()
+                .or_else(|| build_definition_replacement(table))
         })
         .collect()
 }
@@ -242,6 +260,100 @@ fn build_replacement(table: ElementRef<'_>) -> Option<String> {
     };
 
     Some(serialize_table(caption.as_deref(), header, body))
+}
+
+/// Definition tables — every row a `<th>` label beside its `<td>` value, no
+/// header row anywhere (`<tr><th>Entry qualification</th><td>…</td></tr>`;
+/// the university-course-page pattern). The grid path declines them (no
+/// header to align columns against), and htmd's headerless path then eats
+/// the row the first `<th>` came from: a one-row table becomes a lone
+/// pipe-table header with every `<td>` dropped, an N-row table keeps only
+/// the first label with the orphaned `<td>` values misaligned below it.
+///
+/// Unrolled instead into prose: bold labels, then the value cells' HTML as
+/// block content. Claims a table only when EVERY row mixes `th` and `td` and
+/// there is no `<thead>` — a single all-`th` or all-`td` row means a real
+/// header/body table and stays on the htmd path byte-for-byte, preserving
+/// the `headerless_table_is_left_untouched` guarantee.
+fn build_definition_replacement(table: ElementRef<'_>) -> Option<String> {
+    let caption = table
+        .child_elements()
+        .find(|c| c.value().name() == "caption")
+        .map(cell_inner_html);
+
+    let mut out = String::new();
+    let mut rows = 0usize;
+
+    for child in table.child_elements() {
+        let section_rows: Vec<ElementRef<'_>> = match child.value().name() {
+            // A `<thead>` declares gridded-data intent; when the grid path
+            // declines such a table (size caps), leave it untouched too.
+            "thead" => return None,
+            "tbody" | "tfoot" => child
+                .child_elements()
+                .filter(|c| c.value().name() == "tr")
+                .collect(),
+            "tr" => vec![child],
+            _ => continue,
+        };
+
+        for tr in section_rows {
+            let cells = extract_cells(tr);
+            if cells.is_empty() {
+                continue;
+            }
+            let has_th = cells.iter().any(|c| c.is_th);
+            let has_td = cells.iter().any(|c| !c.is_th);
+            // An all-`th` row is a header row and an all-`td` row a data row:
+            // either means this is a gridded table htmd already handles.
+            if !has_th || !has_td {
+                return None;
+            }
+            // Same per-cell ceiling as the grid path, so a table both paths
+            // find oversized declines identically instead of half-converting.
+            if cells.iter().any(|c| c.html.len() > MAX_CELL_HTML) {
+                return None;
+            }
+
+            rows += 1;
+            let labels: Vec<&str> = cells
+                .iter()
+                .filter(|c| c.is_th)
+                .map(|c| c.html.trim())
+                .filter(|h| !h.is_empty())
+                .collect();
+            if !labels.is_empty() {
+                let joined = labels.join(" / ");
+                out.push_str("<p>");
+                // Only pure-text labels get the `<strong>` wrapper — markup in
+                // a label could carry block tags that the parser would
+                // auto-close out of the wrapping `<p>`.
+                if !joined.contains('<') {
+                    out.push_str("<strong>");
+                    out.push_str(&joined);
+                    out.push_str("</strong>");
+                } else {
+                    out.push_str(&joined);
+                }
+                out.push_str("</p>");
+            }
+            for cell in cells.iter().filter(|c| !c.is_th) {
+                out.push_str(&cell.html);
+            }
+            if out.len() > MAX_GRID_BYTES {
+                return None;
+            }
+        }
+    }
+
+    if rows == 0 {
+        return None;
+    }
+
+    if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+        return Some(format!("<p>{cap}</p>{out}"));
+    }
+    Some(out)
 }
 
 fn extract_cells(tr: ElementRef<'_>) -> Vec<RawCell> {
@@ -516,6 +628,84 @@ mod tests {
         </table>"#;
         let out = normalize_tables(html);
         assert_eq!(out, html, "headerless table must not be rewritten");
+    }
+
+    /// Definition tables (`<th>` label + `<td>` value in the same row, no
+    /// header row) are unrolled into bold-label prose — htmd's headerless
+    /// path would otherwise consume the row as a lone pipe-table header and
+    /// drop the `<td>` content entirely (elte.hu course pages rendered
+    /// "Entry qualification" as a heading over nothing).
+    #[test]
+    fn definition_table_is_unrolled_into_prose() {
+        let html = r#"<table>
+            <tbody><tr><th>Entry qualification</th><td><p>Graduate / Master diploma (or higher).</p><p>Good classification.</p></td></tr></tbody>
+        </table>"#;
+        let out = normalize_tables(html);
+        assert!(!out.contains("<table"), "table should be replaced: {out}");
+        assert!(
+            out.contains("<strong>Entry qualification</strong>"),
+            "label not bolded: {out}"
+        );
+        assert!(
+            out.contains("Graduate / Master diploma"),
+            "td block content dropped: {out}"
+        );
+        assert!(
+            out.contains("Good classification"),
+            "second block dropped: {out}"
+        );
+    }
+
+    /// Multi-row definition tables keep EVERY label; htmd would keep only the
+    /// first and render the values orphaned below it.
+    #[test]
+    fn definition_table_multi_row_keeps_all_labels() {
+        let html = r#"<table>
+            <tbody>
+                <tr><th>Language requirements</th><td>English B2</td></tr>
+                <tr><th>Other requirements</th><td>One reference letter.</td></tr>
+            </tbody>
+        </table>"#;
+        let out = normalize_tables(html);
+        assert!(
+            out.contains("<strong>Language requirements</strong>")
+                && out.contains("<strong>Other requirements</strong>"),
+            "labels dropped: {out}"
+        );
+        assert!(
+            out.contains("English B2") && out.contains("One reference letter."),
+            "values dropped: {out}"
+        );
+    }
+
+    /// A table with any unmixed row (all-`th` or all-`td`) is a gridded
+    /// table, not a definition table — byte-for-byte untouched.
+    #[test]
+    fn table_with_unmixed_rows_is_left_untouched() {
+        for html in [
+            r#"<table><tbody><tr><th>Only a label</th></tr></tbody></table>"#,
+            r#"<table><tbody><tr><th>Label</th><td>value</td></tr><tr><td>plain</td><td>row</td></tr></tbody></table>"#,
+            r#"<table><tbody><tr><th>Label</th><td>value</td></tr></tbody><tfoot><tr><td>footer</td></tr></tfoot></table>"#,
+        ] {
+            assert_eq!(
+                normalize_tables(html),
+                html,
+                "must not be rewritten: {html}"
+            );
+        }
+    }
+
+    /// A nested table inside a definition cell lands in the prose exactly
+    /// once — the Pass B depth guard must not count it as a top-level table.
+    #[test]
+    fn definition_table_nested_table_appears_once() {
+        let html = r#"<table><tbody><tr><th>Fees</th><td><table><thead><tr><th>Item</th></tr></thead><tbody><tr><td>NESTED_MARKER</td></tr></tbody></table></td></tr></tbody></table>"#;
+        let out = normalize_tables(html);
+        assert_eq!(out.matches("NESTED_MARKER").count(), 1, "{out}");
+        assert!(
+            out.contains("<strong>Fees</strong>"),
+            "label dropped: {out}"
+        );
     }
 
     /// C1: thead and body grids were rectangularized independently, so a body
