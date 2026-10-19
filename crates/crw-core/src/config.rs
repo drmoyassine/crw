@@ -1715,8 +1715,11 @@ pub struct ExtractionConfig {
     /// Normalize HTML tables (span expansion, header synthesis, headerless-table promotion) before
     /// htmd conversion, and stop the indented-code pass from swallowing list-nested tables. Changes
     /// markdown bytes for any page containing a <table>: this flips /monitor's content hash and can
-    /// reorder the extract alternates ladder on borderline pages. Default false; A/B in prod.
-    #[serde(default)]
+    /// reorder the extract alternates ladder on borderline pages. Default true since 2026-10-19 —
+    /// shipping it off left the whole pipeline dead code in the deployed server, and htmd's
+    /// headerless path silently drops `<td>` content of definition tables (elte.hu course pages
+    /// rendered hollow sections). Set false to restore the byte-identical legacy output.
+    #[serde(default = "default_normalize_tables")]
     pub normalize_tables: bool,
 }
 
@@ -1735,6 +1738,10 @@ fn default_max_concurrent_extracts() -> usize {
     (cpus * 2 / 3).max(2)
 }
 
+fn default_normalize_tables() -> bool {
+    true
+}
+
 impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
@@ -1747,7 +1754,7 @@ impl Default for ExtractionConfig {
             lightpanda_retry_threshold_bytes: default_lightpanda_retry_threshold(),
             max_concurrent_extracts: default_max_concurrent_extracts(),
             reserved_interactive_extracts: None,
-            normalize_tables: false,
+            normalize_tables: default_normalize_tables(),
         }
     }
 }
@@ -3895,7 +3902,7 @@ search_backend_url = "http://from-file:8080"
         assert_eq!(e.lightpanda_retry_threshold_bytes, 2000);
         assert!(e.max_concurrent_extracts >= 2, "must be floored at 2");
         assert_eq!(e.reserved_interactive_extracts, None);
-        assert!(!e.normalize_tables);
+        assert!(e.normalize_tables);
     }
 
     #[test]
@@ -3937,7 +3944,7 @@ search_backend_url = "http://from-file:8080"
             lightpanda_retry_threshold_bytes = 4000
             max_concurrent_extracts = 16
             reserved_interactive_extracts = 3
-            normalize_tables = true
+            normalize_tables = false
             "#,
         )
         .unwrap();
@@ -3947,7 +3954,7 @@ search_backend_url = "http://from-file:8080"
         assert_eq!(e.lightpanda_retry_threshold_bytes, 4000);
         assert_eq!(e.max_concurrent_extracts, 16);
         assert_eq!(e.reserved_interactive_extracts, Some(3));
-        assert!(e.normalize_tables);
+        assert!(!e.normalize_tables);
     }
 
     #[test]
@@ -3955,6 +3962,9 @@ search_backend_url = "http://from-file:8080"
         let e: ExtractionConfig = toml::from_str("").unwrap();
         assert_eq!(e.default_format, "markdown");
         assert!(e.only_main_content);
+        // Absent key must fall back to the same default as `Default`, not
+        // serde's `bool::default()` — the server builds its config by parsing.
+        assert!(e.normalize_tables);
     }
 
     // ==================================================================
