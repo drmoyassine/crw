@@ -40,6 +40,11 @@ services:
     environment:
       - RUST_LOG=info
       - CRW_CONFIG=config.docker
+      # DEC-112 gate: static bearer API key for the public /v1 endpoints.
+      # Panel env CRW_API_KEY must hold a TOML array string, e.g. ["the-key"].
+      # Default [] keeps the API open until the key is configured, so this
+      # passthrough can land before the coordinated key rollout.
+      - 'CRW_AUTH__API_KEYS=${CRW_API_KEY:-[]}'
       # Bench knob passthrough (I4 fix): bench/run_pool_bench.sh sets these
       # to flip pool on/off across two passes without editing config.docker.toml.
       # Defaults match the §B5-flipped config.docker.toml values (pool=on,
