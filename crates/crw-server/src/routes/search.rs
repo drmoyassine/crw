@@ -394,6 +394,15 @@ pub async fn search_inner(
     // empty response can be rejected outright. On the LLM path, page-2 and
     // Wikidata rescues still run, so we only warn and let the request continue.
     if !llm_path && response.is_degraded() {
+        // Ring forensics (2026-09-12 incident class): this 503 means SearXNG
+        // answered 200 with zero results AND dead engines — name the engines
+        // so the ring shows WHICH failed, not just the symptom.
+        tracing::warn!(
+            target: "crw::search",
+            query = %req.query,
+            engines = ?response.unresponsive_engines,
+            "search backend degraded (empty results + unresponsive engines) — rejecting request"
+        );
         return Err(CrwError::SearchDegraded(DEGRADED_MESSAGE.into()));
     }
 
@@ -522,6 +531,12 @@ pub async fn search_inner(
     //     is NOT rescued by them and must still get the warning.
     let structured_rescue = req.answer.unwrap_or(false) && !structured_sources.is_empty();
     if response.is_degraded() && !structured_rescue {
+        tracing::warn!(
+            target: "crw::search",
+            query = %req.query,
+            engines = ?response.unresponsive_engines,
+            "search backend degraded — continuing with a warning (LLM rescue path)"
+        );
         warnings.push(DEGRADED_MESSAGE.into());
     }
     // Snippet-first (lazy scrape): on the answer path, defer the scrape and try to

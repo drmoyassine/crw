@@ -35,11 +35,17 @@ async fn main() {
 }
 
 async fn run_server() {
-    // Initialize tracing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Initialize tracing. Plain `fmt()` writes stdout only, and on
+    // Easypanel-hosted deployments the panel's docker-log readout is a paid
+    // (license-gated) feature — stdout history is unreadable exactly when a
+    // flap needs forensics. `RingLayer` mirrors every event into a bounded
+    // in-RAM ring read back via `GET /internal/logs` (auth-gated).
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(crw_server::logring::RingLayer)
         .init();
 
     // Eagerly register Prometheus metrics so alert rules see present series at boot.
@@ -148,6 +154,14 @@ async fn run_server() {
     if state.renderer.js_renderer_names().is_empty() {
         tracing::warn!("No CDP renderer active — JS rendering disabled");
     }
+
+    // Host/sibling health sampler: one info line per tick (loadavg, host CPU
+    // %, cgroup CPU %, searxng/CDP liveness) into the ring, so a later flap
+    // can be correlated against host saturation. /proc inside a container
+    // reports HOST-wide numbers (procfs is not namespaced for loadavg/stat),
+    // which is exactly the vantage point we want. Cadence knob:
+    // CRW_DIAG__SAMPLE_SECS (default 15s, min 5s).
+    crw_server::hoststats::spawn_sampler(&state.config);
 
     // Issue #90: one-shot, non-fatal reachability probe so a misconfigured or
     // down SearXNG is *spoken* at boot instead of failing silently on the first
