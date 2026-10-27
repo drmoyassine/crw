@@ -77,6 +77,18 @@ pub fn create_app(state: AppState) -> Router {
         .route(
             "/admin/breakers/reset",
             post(routes::breakers::reset_breakers).fallback(method_not_allowed),
+        )
+        // Operator diagnostics: log-ring readback + health snapshot. Same
+        // family as /metrics — root-level, inside the auth boundary, NOT part
+        // of the versioned Firecrawl-compat surface (never mirrored under
+        // /firecrawl/*). See routes::internal.
+        .route(
+            "/internal/logs",
+            get(routes::internal::logs).fallback(method_not_allowed),
+        )
+        .route(
+            "/internal/health",
+            get(routes::internal::health).fallback(method_not_allowed),
         );
 
     let api_routes = if api_keys.is_empty() {
@@ -134,6 +146,12 @@ pub fn create_app(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
+        ))
+        // Error-boundary capture into the diagnostic ring (see middleware::
+        // error_capture_middleware). Added after rate-limit/timeout so this
+        // layer sits OUTSIDE them and their 429/504 responses are captured.
+        .layer(axum::middleware::from_fn(
+            crate::middleware::error_capture_middleware,
         ));
 
     // CORS is opt-in via `server.cors_allowed_origins`. Empty (default) = no

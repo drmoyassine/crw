@@ -7,6 +7,8 @@
 //! - [`middleware`] — Auth middleware with constant-time Bearer token comparison
 //! - [`error`] — HTTP error responses
 //! - [`state`] — Shared application state (renderer, crawler, config)
+//! - [`logring`] — In-RAM diagnostic log ring read back via `/internal/logs`
+//! - [`hoststats`] — Host + sibling-container health sampler for the ring
 //!
 //! # Example
 //!
@@ -23,6 +25,8 @@
 pub mod app;
 pub mod diagnostics;
 pub mod error;
+pub mod hoststats;
+pub mod logring;
 pub mod middleware;
 pub mod routes;
 pub mod setup;
